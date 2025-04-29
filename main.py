@@ -245,7 +245,8 @@ def load_persuade(training_examples, test_examples=5):
     unformatted_test_texts = [essays[i] for i in test_indices]
     return positive_texts, negative_texts, test_texts, unformatted_test_texts
 
-def evaluate_persuade(config, steerer, test_texts, encouraging=False ):
+def evaluate_persuade(config, steerer, test_texts, encourage_explicitly=False ):
+    # model-graded comparison of steered vs natural feedback (where natural carries/does not carry explicit encouragement)
     # default_model = PromptSteerer(config['model'], "{prompt}", False)
     feedback_evaluator = FeedbackEvaluator() # Provider might need API keys etc.
 
@@ -262,10 +263,11 @@ def evaluate_persuade(config, steerer, test_texts, encouraging=False ):
         prompt = f"Essay: {prompt} Request: Give kind feedback for this essay which is encouraging"
 
         steered_output = steerer.generate(prompt, max_length=250, coeff=config['steering_coeff'])
-        if not encouraging:
-            unsteered_output = steerer.generate_uncontrolled(prompt, max_length=250)
-        else:
-            unsteered_output = steerer.generate_uncontrolled(encouraging_prompt, max_length=250)
+        # evaluate against unsteered feedback: 
+        unsteered_output = steerer.generate_uncontrolled(
+            encouraging_prompt if encourage_explicitly else prompt, 
+            max_length=250
+        )
         generated_outputs.append([steered_output, unsteered_output])
 
         result = feedback_evaluator.compare_feedback(steered_output, unsteered_output) # Modify if comparing against well_prompted
@@ -362,7 +364,7 @@ def wand_b_iteration(config=None):
 
         if config['dataset'] == 'persuade':
             generated_outputs, total_steered_winner, percent_win = evaluate_persuade(config, steerer, test_texts)
-            generated_outputs_encouraging, total_steered_winner_encouraging, percent_win_encouraging = evaluate_persuade(config, steerer, test_texts, encouraging=True )
+            generated_outputs_encouraging, total_steered_winner_encouraging, percent_win_encouraging = evaluate_persuade(config, steerer, test_texts, encourage_explicitly=True )
  
         elif config['dataset'] == 'mmlu':
             pass 
@@ -376,7 +378,7 @@ def wand_b_iteration(config=None):
     finally:
         run.finish()
 
-    return {"config": config, "percent_win": percent_win, "percent_win_encourgaging": percent_win_encouraging, "texts": generated_outputs, "result": "success"}
+    return {"config": config, "percent_win": percent_win, "percent_win_encouraging": percent_win_encouraging, "texts": generated_outputs, "result": "success"}
 
 
 def wand_b_sweep():
