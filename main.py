@@ -85,25 +85,20 @@ def evaluate_persuade(config, steerer, test_texts, encouraging=False ):
     return generated_outputs,total_steered_winner,percent_win
 
 
-def load_mmlu(domains: List[str], training_examples=100, train_test_split=0.8):
+def load_mmlu(domain: str, training_examples=100, train_test_split=0.8):
     # TODO: Kinda gross.. maybe use DataLoader instead
-    in_domain = MMLUDataset(sample_size=training_examples // 2, split='test', domains=domains, in_domain=True)
-    out_of_domain = MMLUDataset(sample_size=training_examples // 2, split='test', domains=domains, in_domain=False)
+    in_domain = MMLUDataset(sample_size=training_examples // 2, split='test', domain=domain, in_domain=True)
+    out_of_domain = MMLUDataset(sample_size=training_examples // 2, split='test', domain=domain, in_domain=False)
 
+    test_count = int(len(in_domain)*(1-train_test_split) // 2)
+    test_indices = np.random.choice(len(out_of_domain), size=test_count, replace=False if test_count < len(out_of_domain) else True)
+    test_questions_ood = [out_of_domain[i][0] for i in test_indices] # Same fix for test_prompts
+    test_answers_ood = [out_of_domain[i][1] for i in test_indices]
+    out_of_domain = [out_of_domain[i][0] for i in range(len(out_of_domain)) if i not in test_indices]
 
-    # For out-of-domain data
-    ood_total = len(out_of_domain)
-    ood_test_count = int(ood_total * (1-train_test_split))
-    ood_test_indices = np.random.choice(ood_total, size=ood_test_count, replace=False if ood_test_count < ood_total else True)
-    ood_train_indices = [i for i in range(ood_total) if i not in ood_test_indices]
-    test_ood = out_of_domain[ood_test_indices]
-    train_ood = out_of_domain[ood_train_indices]
-
-    # For in-domain data
-    in_total = len(in_domain)
-    in_test_count = int(in_total * (1-train_test_split))
-    in_test_indices = np.random.choice(in_total, size=in_test_count, replace=False if in_test_count < in_total else True)
-    in_train_indices = [i for i in range(in_total) if i not in in_test_indices]
+    test_count = int(len(out_of_domain)*(1-train_test_split) // 2)
+    test_indices = np.random.choice(len(in_domain), size=test_count, replace=False if test_count < len(in_domain) else True)
+    test_questions_in_domain = [in_domain[i][0] for i in_test_indices]
     test_in_domain = in_domain[in_test_indices]
     train_in_domain = in_domain[in_train_indices]
 
@@ -120,56 +115,69 @@ def load_mmlu(domains: List[str], training_examples=100, train_test_split=0.8):
 
 
 
+def evaluate_scoper(config, scoper, test_questions, test_answers, parser_type="logits"):
+    if config['dataset']=="mmlu":
+        evaluator = MMLUEvaluator(scoper.tokenizer, parser_type) # Provider might need API keys etc.
+    else:
+        pass
+    dataloader = DataLoader(test_questions, batch_size=10)
+    
+    test_count = 0
+    running_accuracy = 0
+    for questions, answers in dataloader: # TODO: Can probably kick over to use DistributedDataset
+        steered_output = scoper(questions).logits
 
-def mmlu_iteration(config=None):
+        test_count += len(questions)
+        running_accuracy += evaluator(steered_output, answers)
+        
+    return running_accuracy/test_count
+
+def load_dataset(dataset, domains, training_size, test_size):
+    train_test_split = training_size/(test_size+training_size)
+    if dataset == 'mmlu':
+        return load_mmlu(domains, test_size+training_size, train_test_split)
+    elif dataset == 'sni':
+        return load_sni(domains, test_size+training_size, train_test_split)
+    else:
+        print('Unknown dataset - failed to load:', dataset)
+
+def scoping_iteration(config=None):
     """
     Runs a single sweep trial, initializing and cleaning up
     torch.distributed for rank=0, world_size=1.
     """
     run = wandb.init(
-        project="scoped-llm"
+        project="scoped-llm",
+        config=config
     )
-    config = wandb.config
 
-
+    # config=wandb.config
 
     try:
         torch.cuda.empty_cache()
 
-        in_domain, out_of_domain, test_dataset = load_mmlu(domains=config['domains'], training_examples=config['training_examples'])
+        in_domain, out_of_domain, tests = load_dataset(dataset=config['dataset'], domain=config['domain'], training_size=config['training_size'], test_size=config['test_size']])
         model_name = config['model'].replace('.', '_').replace('/', '_')
         filename = f"{model_name}_{config['scoper_type']}_vectors"
-        folder = os.path.join(os.getcwd(), "scoping_activations")
+        folder = os.path.join(os.getcwd(), config['scoper_type'])
         path = str(os.path.join(folder, filename))
-
-        if config['scoper_type'] == 'linear_probe_scoper':
-            scoper = ScopeClassifier(config['model'], save_folder_path=path)
-        elif config['scoper_type'] == 'hardened_prompt_scoper':
-            scoper = HardenedPromptScoper(config['model'], domains=config['domains'])
-        elif config['scoper_type'] == 'prompt_classification_scoper':
-           scoper = PromptClassificationScoper(config['model'], domains=config['domains'])
-        elif config['scoper_type'] == 'circuit_breaker_scoper':
-            scoper = CircuitBreakerScoper(config['model'], save_folder_path=path)
-    
-        scoper.train(in_domain, out_of_domain, batch_size=10)
         if not os.path.exists(folder):
             os.makedirs(folder)
+            
+        if config['scoper_type'] == 'linear_probe_scoper':
+            scoper = ScopeClassifier(config['model'], save_folder_path=path)
+        elif config['scoper_type'] == 'circuit_breaker_scoper':
+            pass
+        elif config['scoper_type'] == 'constitutional_scoper':
+            pass
+        elif config['scoper_type'] == 'activation_scoper':
+            pass
+        else:
+            raise ValueError(f"Unknown scoper - failed to configure {config['scoper_type']}")
 
-        mmlu_evaluator = MMLUEvaluator(scoper.tokenizer, 'logits') # Provider might need API keys etc.
-
-        questions = test_dataset.data
-        batch_size = 2
-
-        steered_output = None
-        for i in range(0, len(questions), batch_size):
-            batch = questions[i:i + batch_size]
-            batch_steered_output = scoper(batch).logits
-            batch_steered_output = batch_steered_output[:, -1]
-            if steered_output is None:
-                steered_output = torch.zeros((len(questions), batch_steered_output.shape[-1]))
-            steered_output[i:i + batch_size] = batch_steered_output
-
-        in_domain_accuracy, out_of_domain_accuracy, accuracy, precision, recall, f1_score = mmlu_evaluator(steered_output, test_dataset)
+        scoper.train(in_domain, out_of_domain, batch_size=10)
+        
+        accuracy = evaluate_scoper(config, scoper, test_questions, test_answers)
         
         wandb.log({"accuracy": accuracy, "precision": precision, "recall": recall, "f1_score": f1_score, "in_domain_accuracy": in_domain_accuracy, "out_of_domain_accuracy": out_of_domain_accuracy, "result": "success"})
     except Exception as e:
@@ -190,39 +198,55 @@ def wand_b_sweep():
     sweep_configuration = {
         'method': 'random',
         'name': 'sweep',
-        'metric': {'goal': 'maximize', 'name': 'accuracy'},
+        'metric': {'goal': 'maximize', 'name': 'percent_win'},
         'parameters': {
-            'model': {'values': ['unsloth/Llama-3.2-3B-Instruct', 'unsloth/Llama-3.2-1B-Instruct', 'unsloth/Meta-Llama-3.1-8B', 'google/gemma-2-27b' ]},
-            'scoper_type':{'values': ['circuit_breaker_scoper', 'prompt_classification_scoper','hardened_prompt_scoper','linear_probe_scoper' ]}, # 'torch', 'linear_probe', 
-            'domains': {'values': [
-                ["astronomy"], 
-                "stem", 
-                ['world_religions'],
-                ['virology'],
-                ['philosophy'],
-                ['marketing'],
-                ['astronomy'],
-                ['professional_law', 'jurisprudence', 'business_ethics'],
-                ['high_school_biology', 'college_biology', 'medical_genetics'],
-                ['high_school_mathematics', 'college_mathematics', 'elementary_mathematics'],
-                ['high_school_psychology', 'professional_psychology', 'moral_scenarios'],
-                ['high_school_world_history', 'high_school_european_history', 'high_school_us_history', 'prehistory']
-                ]},
+            'model': {'values': ['unsloth/Llama-3.2-3B-Instruct']},
+            'scoper_type':{'values': ['hardened_prompt_scoper']},#, 'linear_probe_scoper' ]}, # 'torch', 'linear_probe', 
+            'domains': {'values': [["astronomy"]]},
             'dataset': {'value': 'mmlu'},
-            'training_examples': {'value': 1000},
-            'test_examples': {'value': 100},
-            'batch_size': {'value': 2}
+            'training_size': {'value': 1000},
+            'test_size': {'value': 100},
+            'batch_size': {'value': 5}
         },
     }
 
     sweep_id = wandb.sweep(sweep=sweep_configuration, project='my-test-project')
-    wandb.agent(sweep_id, function=mmlu_iteration,  count=25)
+    wandb.agent(sweep_id, function=wand_b_iteration, count=10)
+
+import itertools
+def my_sweep():
+
+    large_models = ['unsloth/Llama-3.3-70B-Instruct', 'Qwen/Qwen2.5-32B-Instruct']
+    medium_models = None
+    small_models_1 = ['unsloth/Llama-3.2-3B-Instruct', ]
+    small_models_2 = None
+
+    logs = []
+    param_grid = {
+        'model': small_models_1,
+        'scoper_type': ['linear_probe_scoper'], # constitutional_scoper, circuit_breaker_scoper, activation_scoper
+        'domains': ['stem'],
+        'dataset': ['mmlu'],
+        'training_size': [100],
+        'test_size': [10],
+        'batch_size': [10]
+    }
+
+    # --- Generate Combinations ---
+    keys, values = zip(*param_grid.items())
+    config_combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+
+    for i, config in enumerate(config_combinations):
+        results = mmlu_iteration(config)
+        with open("logs.txt", "a") as f:
+            f.write(str(results) + "\n")
 
 
 if __name__ == '__main__':
     torch.cuda.empty_cache()
     load_dotenv()
 
+    my_sweep()
     wand_b_sweep()
 
 
